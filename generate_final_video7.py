@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Vertical typography video pipeline (1080x1920) → final_video5.mp4.
-Steps: 1) Download assets  2) TTS per scene (Sarvam Bulbul v3)  3) Measure duration
-4) Generate per-scene MP4 (letterbox, overlay then drawtext, heavy shadow)
-5) Concat  6) Cleanup. API key from .env. 30fps, libx264.
+Vertical typography video pipeline (1080x1920) → final_video7.mp4.
+17 scenes. Letterbox (drawbox y=600 h=720) except Scene 10 (full black).
+2 fonts (serif + cartoon), 4 images. TTS Sarvam from .env. No fallbacks/placeholders.
 """
 
 import base64
@@ -12,26 +11,41 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import urllib.error
 
-SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "your_sarvam_api_key_here")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WIDTH = 1080
 HEIGHT = 1920
 FPS = 30
 TTS_URL = "https://api.sarvam.ai/text-to-speech"
+SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "your_sarvam_api_key_here")
 
-FONT_PATH = os.path.join(SCRIPT_DIR, "luckiest_guy.ttf")
-OUTPUT_MP4 = os.path.join(SCRIPT_DIR, "final_video5.mp4")
-SEGMENTS_DIR = os.path.join(SCRIPT_DIR, "video5_segments")
-CONCAT_LIST = os.path.join(SCRIPT_DIR, "scenes_v5.txt")
+SERIF_FONT = os.path.join(SCRIPT_DIR, "serif_font.ttf")
+CARTOON_FONT = os.path.join(SCRIPT_DIR, "cartoon_font.ttf")
+OUTPUT_MP4 = os.path.join(SCRIPT_DIR, "final_video7.mp4")
+SEGMENTS_DIR = os.path.join(SCRIPT_DIR, "video7_segments")
+CONCAT_LIST = os.path.join(SCRIPT_DIR, "scenes_v7.txt")
 
-# Exact images from web: Wikipedia cat silhouette first (can 429), then jsDelivr fallbacks
+# Distinct images: heart-eyes cat, worried cat, dog, smiley cat (twemoji 1f63b, 1f63f, 1f436, 1f63a)
 ASSETS = {
-    "luckiest_guy.ttf": "https://github.com/google/fonts/raw/main/apache/luckiestguy/LuckiestGuy-Regular.ttf",
-    "happy_cat.png": [
-        "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/1f431.png",
+    "serif_font.ttf": "https://raw.githubusercontent.com/google/fonts/main/ofl/ptserif/PT_Serif-Web-Bold.ttf",
+    "cartoon_font.ttf": "https://raw.githubusercontent.com/google/fonts/main/apache/luckiestguy/LuckiestGuy-Regular.ttf",
+    "heart_cat.png": [
+        "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/1f63b.png",
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a9/Cat_silhouette.svg/512px-Cat_silhouette.svg.png",
+    ],
+    "crying_cat.png": [
+        "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/1f63f.png",
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a9/Cat_silhouette.svg/512px-Cat_silhouette.svg.png",
+    ],
+    "dog.png": [
+        "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/1f436.png",
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/2/26/YellowLabradorLooking_new.jpg/512px-YellowLabradorLooking_new.jpg",
+    ],
+    "blush_cat.png": [
+        "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/1f63a.png",
         "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a9/Cat_silhouette.svg/512px-Cat_silhouette.svg.png",
     ],
 }
@@ -58,9 +72,6 @@ _load_dotenv()
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "your_sarvam_api_key_here")
 
 
-# -----------------------------------------------------------------------------
-# STEP 1: ASSET DOWNLOADER (requests)
-# -----------------------------------------------------------------------------
 def download_assets():
     try:
         import requests
@@ -81,7 +92,6 @@ def download_assets():
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return resp.read()
 
-    import time
     for fname, urls in ASSETS.items():
         path = os.path.join(SCRIPT_DIR, fname)
         if not os.path.isfile(path):
@@ -100,13 +110,10 @@ def download_assets():
                 except Exception as e:
                     print(f"  Try failed {fname}: {e}", file=sys.stderr)
             if not os.path.isfile(path):
-                print(f"  ERROR: Could not download {fname} from any URL. Asset must be downloaded from web.", file=sys.stderr)
+                print(f"  ERROR: Could not download {fname}. Asset must be downloaded from web.", file=sys.stderr)
                 sys.exit(1)
 
 
-# -----------------------------------------------------------------------------
-# STEP 2: TTS (Sarvam) + fallback silent WAV len(text)*0.08
-# -----------------------------------------------------------------------------
 def generate_audio(text: str, filename: str) -> bool:
     if not text or not text.strip():
         _silent_wav(filename, 0.5)
@@ -167,6 +174,11 @@ def get_audio_duration_sec(path: str) -> float:
     except Exception:
         pass
     try:
+        from mutagen.wave import WAVE
+        return WAVE(path).info.length
+    except Exception:
+        pass
+    try:
         import wave
         with wave.open(path, "rb") as w:
             return w.getnframes() / float(w.getframerate())
@@ -183,108 +195,84 @@ def get_audio_duration_sec(path: str) -> float:
     return 2.0
 
 
-def pad_wav_to_duration(wav_path: str, min_duration: float) -> float:
-    """Pad WAV with silence to at least min_duration; overwrites file. Returns actual duration used."""
-    d = get_audio_duration_sec(wav_path)
-    if d >= min_duration:
-        return d
-    out_path = wav_path + ".padded"
-    r = subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", wav_path, "-af", f"apad=whole_dur={min_duration}", "-t", str(min_duration),
-            "-acodec", "pcm_s16le", "-ar", "24000", out_path,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    if r.returncode == 0 and os.path.isfile(out_path):
-        os.replace(out_path, wav_path)
-        return min_duration
-    return d
-
-
-# -----------------------------------------------------------------------------
-# STEP 3: SCENE CONFIG (letterbox band, images, texts with X,Y,t)
-# -----------------------------------------------------------------------------
 def escape_drawtext(s: str) -> str:
-    return s.replace("\\", "\\\\").replace("'", "'\\''")
+    # For filter_complex_script: backslash and double single-quote for apostrophe (e.g. Valentine's)
+    return s.replace("\\", "\\\\").replace("'", "''")
 
 
-# Band color as FFmpeg hex (0x6b0000). Text x can be int or "(w-tw)/2".
+# 17 scenes. band_color None = Scene 10 full black. Text font defaults to serif; scene 10 uses cartoon_font + shadow.
 SCENES = [
-    {
-        "transcript": "I'm always happy",
-        "band_color": "0x6b0000",
-        "images": [{"path": "happy_cat.png", "scale_w": 350, "x": 50, "y": 950, "t": 0.0}],
-        "texts": [
-            {"text": "I'M", "color": "0xFFFFFF", "size": 180, "x": 200, "y": 700, "t": 0.0},
-            {"text": "ALWAYS", "color": "0xffe599", "size": 150, "x": 450, "y": 730, "t": 0.4},
-            {"text": "HAPPY", "color": "0xd7b87a", "size": 160, "x": 500, "y": 900, "t": 0.8},
-        ],
-    },
-    {
-        "transcript": "because I don't expect anything from anyone",
-        "band_color": "0xfbf8cc",
-        "images": [{"path": "happy_cat.png", "scale_w": 350, "x": 350, "y": 950, "t": 0.0}],
-        "texts": [
-            {"text": "BECAUSE", "color": "0x800000", "size": 140, "x": 50, "y": 650, "t": 0.0},
-            {"text": "I DON'T", "color": "0x38761d", "size": 130, "x": 600, "y": 650, "t": 0.5},
-            {"text": "EXPECT", "color": "0xffffff", "size": 150, "x": 50, "y": 800, "t": 1.0},
-            {"text": "ANYTHING", "color": "0x800000", "size": 140, "x": 50, "y": 900, "t": 1.5},
-            {"text": "FROM ANYONE", "color": "0xffffff", "size": 120, "x": 50, "y": 1180, "t": 2.0},
-        ],
-    },
-    {
-        "transcript": "and expectations always hurt",
-        "band_color": "0x4a5d23",
-        "images": [{"path": "happy_cat.png", "scale_w": 350, "x": 50, "y": 950, "t": 0.0}],
-        "texts": [
-            {"text": "EXPECTATIONS", "color": "0xffffff", "size": 130, "x": 150, "y": 750, "t": 0.0},
-            {"text": "ALWAYS", "color": "0xffe599", "size": 120, "x": 450, "y": 900, "t": 1.0},
-            {"text": "HURT", "color": "0xffffff", "size": 180, "x": 450, "y": 1050, "t": 1.5},
-        ],
-    },
-    {
-        "transcript": "So keep smiling,",
-        "band_color": "0x6b0000",
-        "images": [],
-        "texts": [
-            {"text": "SO", "color": "0xffe599", "size": 150, "x": "(w-tw)/2", "y": 650, "t": 0.0},
-            {"text": "KEEP", "color": "0xffe599", "size": 180, "x": "(w-tw)/2", "y": 850, "t": 0.4},
-            {"text": "SMILING", "color": "0xffe599", "size": 160, "x": "(w-tw)/2", "y": 1050, "t": 0.8},
-        ],
-    },
-    {
-        "transcript": "be happy",
-        "band_color": "0x6b0000",
-        "images": [],
-        "texts": [
-            {"text": "BE", "color": "0xffe599", "size": 180, "x": "(w-tw)/2", "y": 750, "t": 0.0},
-            {"text": "HAPPY", "color": "0xffe599", "size": 180, "x": "(w-tw)/2", "y": 950, "t": 0.5},
-        ],
-    },
-    {
-        "transcript": "and live for yourself",
-        "band_color": "0x6b0000",
-        "images": [],
-        "texts": [
-            {"text": "AND", "color": "0xffe599", "size": 150, "x": "(w-tw)/2", "y": 650, "t": 0.0},
-            {"text": "LIVE", "color": "0xffe599", "size": 180, "x": "(w-tw)/2", "y": 800, "t": 0.25},
-            {"text": "FOR", "color": "0xffe599", "size": 150, "x": "(w-tw)/2", "y": 950, "t": 0.5},
-            {"text": "YOURSELF", "color": "0xffe599", "size": 160, "x": "(w-tw)/2", "y": 1050, "t": 0.75},
-        ],
-    },
+    {"transcript": "Valentine's Day is coming.", "band_color": "0xf4f1e1", "image": {"path": "heart_cat.png", "scale_w": 300, "x": "main_w-overlay_w-50", "y": 900, "t": 0.0}, "texts": [
+        {"text": "Valentine's", "color": "0xc81d25", "size": 130, "x": 100, "y": 700, "t": 0.0},
+        {"text": "Day is", "color": "0x1b2a47", "size": 110, "x": 100, "y": 850, "t": 0.5},
+        {"text": "COMING.", "color": "0xf4d03f", "size": 140, "x": 100, "y": 1000, "t": 1.0},
+    ]},
+    {"transcript": "And people are asking,", "band_color": "0x6488a7", "image": None, "texts": [
+        {"text": "AND PEOPLE ARE ASKING,", "color": "0xffffff", "size": 82, "x": "(w-tw)/2", "y": 850, "t": 0.0},
+    ]},
+    {"transcript": "Are you single?", "band_color": "0x1b2a47", "image": {"path": "crying_cat.png", "scale_w": 250, "x": "main_w-overlay_w-50", "y": 800, "t": 0.0}, "texts": [
+        {"text": "ARE YOU", "color": "0xffffff", "size": 120, "x": "(w-tw)/2", "y": 750, "t": 0.0},
+        {"text": "SINGLE?", "color": "0xf4d03f", "size": 150, "x": "(w-tw)/2", "y": 920, "t": 0.5},
+    ]},
+    {"transcript": "But the real question is,", "band_color": "0x1b2a47", "image": None, "texts": [
+        {"text": "BUT THE REAL QUESTION IS,", "color": "0xffffff", "size": 68, "x": "(w-tw)/2", "y": 850, "t": 0.0},
+    ]},
+    {"transcript": "When you were completely broken,", "band_color": "0x1b2a47", "image": None, "texts": [
+        {"text": "WHEN YOU WERE", "color": "0xffffff", "size": 100, "x": "(w-tw)/2", "y": 700, "t": 0.0},
+        {"text": "COMPLETELY", "color": "0xffffff", "size": 120, "x": "(w-tw)/2", "y": 850, "t": 0.6},
+        {"text": "BROKEN,", "color": "0xffffff", "size": 130, "x": "(w-tw)/2", "y": 1000, "t": 1.2},
+    ]},
+    {"transcript": "who was there?", "band_color": "0x1b2a47", "image": None, "texts": [
+        {"text": "WHO WAS THERE?", "color": "0xf4d03f", "size": 120, "x": "(w-tw)/2", "y": 850, "t": 0.0},
+    ]},
+    {"transcript": "Not that one who said,", "band_color": "0x1b2a47", "image": None, "texts": [
+        {"text": "NOT THAT ONE WHO SAID,", "color": "0xffffff", "size": 72, "x": "(w-tw)/2", "y": 850, "t": 0.0},
+    ]},
+    {"transcript": "I love you,", "band_color": "0xf4f1e1", "image": None, "texts": [
+        {"text": "\"I LOVE YOU,\"", "color": "0x1b2a47", "size": 130, "x": "(w-tw)/2", "y": 850, "t": 0.0},
+    ]},
+    {"transcript": "But one who said,", "band_color": "0xf4f1e1", "image": None, "texts": [
+        {"text": "BUT ONE WHO SAID,", "color": "0x1b2a47", "size": 88, "x": "(w-tw)/2", "y": 850, "t": 0.0},
+    ]},
+    {"transcript": "Bro wait I'm coming", "band_color": None, "image": {"path": "dog.png", "scale_w": 350, "x": 50, "y": 780, "t": 0.0}, "texts": [
+        {"text": "BRO", "color": "0xffffff", "size": 180, "x": "w-tw-80", "y": 700, "t": 0.0, "font": "cartoon_font.ttf", "shadow": (5, 5)},
+        {"text": "WAIT", "color": "0xffffff", "size": 180, "x": "w-tw-80", "y": 880, "t": 0.4, "font": "cartoon_font.ttf", "shadow": (5, 5)},
+        {"text": "I'M COMING", "color": "0xffffff", "size": 150, "x": "w-tw-80", "y": 1060, "t": 0.8, "font": "cartoon_font.ttf", "shadow": (5, 5)},
+    ]},
+    {"transcript": "Didn't care about day or time,", "band_color": "0x6488a7", "image": None, "texts": [
+        {"text": "DIDN'T CARE", "color": "0x1b2a47", "size": 120, "x": "(w-tw)/2", "y": 750, "t": 0.0},
+        {"text": "ABOUT DAY OR TIME,", "color": "0xffffff", "size": 92, "x": "(w-tw)/2", "y": 900, "t": 0.8},
+    ]},
+    {"transcript": "Just stayed and proved what friendship really means.", "band_color": "0x1b2a47", "image": None, "texts": [
+        {"text": "JUST STAYED AND PROVED", "color": "0xffffff", "size": 72, "x": "(w-tw)/2", "y": 750, "t": 0.0},
+        {"text": "WHAT FRIENDSHIP REALLY MEANS.", "color": "0xf4d03f", "size": 62, "x": "(w-tw)/2", "y": 900, "t": 1.0},
+    ]},
+    {"transcript": "So this Valentine's Day,", "band_color": "0xf4f1e1", "image": None, "texts": [
+        {"text": "SO THIS", "color": "0x1b2a47", "size": 110, "x": 150, "y": 750, "t": 0.0},
+        {"text": "VALENTINE'S DAY,", "color": "0x1b2a47", "size": 120, "x": 150, "y": 900, "t": 0.5},
+    ]},
+    {"transcript": "don't celebrate love.", "band_color": "0x1b2a47", "image": None, "texts": [
+        {"text": "Don't celebrate love.", "color": "0xffffff", "size": 92, "x": "(w-tw)/2", "y": 850, "t": 0.0},
+    ]},
+    {"transcript": "Celebrate that friendship", "band_color": "0xf4f1e1", "image": None, "texts": [
+        {"text": "CELEBRATE THAT", "color": "0x1b2a47", "size": 100, "x": 150, "y": 750, "t": 0.0},
+        {"text": "FRIENDSHIP", "color": "0x1b2a47", "size": 130, "x": 150, "y": 900, "t": 0.5},
+    ]},
+    {"transcript": "which stays with you", "band_color": "0xf4f1e1", "image": None, "texts": [
+        {"text": "WHICH STAYS WITH YOU", "color": "0x1b2a47", "size": 82, "x": "(w-tw)/2", "y": 850, "t": 0.0},
+    ]},
+    {"transcript": "without any conditions.", "band_color": "0xf4f1e1", "image": {"path": "blush_cat.png", "scale_w": 300, "x": "main_w-overlay_w-50", "y": 800, "t": 0.0}, "texts": [
+        {"text": "WITHOUT ANY", "color": "0x1b2a47", "size": 100, "x": 100, "y": 750, "t": 0.0},
+        {"text": "CONDITIONS.", "color": "0x1b2a47", "size": 110, "x": 100, "y": 900, "t": 0.5},
+    ]},
 ]
 
 
-# -----------------------------------------------------------------------------
-# STEP 4: create_scene_video — drawbox, overlay(s) FIRST, then drawtext (shadow)
-# -----------------------------------------------------------------------------
 def create_scene_video(scene_data: dict, audio_path: str, output_path: str, duration: float) -> bool:
-    fontfile = FONT_PATH
-    if not os.path.isfile(fontfile):
-        print(f"  Missing font: {fontfile}", file=sys.stderr)
+    serif_path = SERIF_FONT
+    cartoon_path = CARTOON_FONT
+    if not os.path.isfile(serif_path) or not os.path.isfile(cartoon_path):
+        print(f"  Missing font(s)", file=sys.stderr)
         return False
 
     parts = []
@@ -294,19 +282,17 @@ def create_scene_video(scene_data: dict, audio_path: str, output_path: str, dura
         parts.append(f"[{vid}]drawbox=y=600:w=1080:h=720:color={band}:t=fill[bg]")
         vid = "bg"
 
-    images = scene_data.get("images") or []
+    im = scene_data.get("image")
     img_path = None
-    for i, im in enumerate(images):
+    if im:
         path = os.path.join(SCRIPT_DIR, im["path"])
-        if not os.path.isfile(path):
-            continue
-        if img_path is None:
+        if os.path.isfile(path):
             img_path = path
-        w, x, y, t0 = im.get("scale_w", 350), im["x"], im["y"], im.get("t", 0.0)
-        parts.append(f"[1:v]scale={w}:-1[img{i}]")
-        t0_esc = str(t0).replace(",", "\\,")
-        parts.append(f"[{vid}][img{i}]overlay={x}:{y}:enable='gte(t\\,{t0_esc})'[ov{i}]")
-        vid = f"ov{i}"
+            w, x, y, t0 = im.get("scale_w", 300), im["x"], im["y"], im.get("t", 0.0)
+            t0_esc = str(t0).replace(",", "\\,")
+            parts.append(f"[1:v]scale={w}:-1[img]")
+            parts.append(f"[{vid}][img]overlay={x}:{y}:enable='gte(t\\,{t0_esc})'[v1]")
+            vid = "v1"
 
     next_idx = 0
     for line in scene_data.get("texts") or []:
@@ -316,12 +302,18 @@ def create_scene_video(scene_data: dict, audio_path: str, output_path: str, dura
         size = line["size"]
         x = line["x"]
         y = line["y"]
+        fontfile = os.path.join(SCRIPT_DIR, line.get("font", "serif_font.ttf"))
+        if not os.path.isfile(fontfile):
+            fontfile = serif_path
         x_str = str(x)
         t_esc = str(t).replace(",", "\\,")
-        parts.append(
-            f"[{vid}]drawtext=fontfile='{fontfile}':text='{text}':fontsize={size}:fontcolor={color}:"
-            f"x={x_str}:y={y}:shadowcolor=black:shadowx=6:shadowy=6:enable='gte(t\\,{t_esc})'[tx{next_idx}]"
-        )
+        shadow = line.get("shadow")
+        if shadow:
+            sx, sy = shadow
+            draw = f"[{vid}]drawtext=fontfile='{fontfile}':text='{text}':fontsize={size}:fontcolor={color}:x={x_str}:y={y}:shadowcolor=black:shadowx={sx}:shadowy={sy}:enable='gte(t\\,{t_esc})'"
+        else:
+            draw = f"[{vid}]drawtext=fontfile='{fontfile}':text='{text}':fontsize={size}:fontcolor={color}:x={x_str}:y={y}:enable='gte(t\\,{t_esc})'"
+        parts.append(draw + f"[tx{next_idx}]")
         vid = f"tx{next_idx}"
         next_idx += 1
 
@@ -334,19 +326,21 @@ def create_scene_video(scene_data: dict, audio_path: str, output_path: str, dura
             f.write(filter_body)
     except Exception:
         os.close(fd)
-        os.remove(filter_script)
+        try:
+            os.remove(filter_script)
+        except OSError:
+            pass
         raise
 
     try:
         cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=black:s={WIDTH}x{HEIGHT}:d={duration}:r={FPS}"]
         audio_idx = 1
-        if images and img_path and os.path.isfile(img_path):
+        if im and img_path:
             cmd.extend(["-loop", "1", "-i", img_path])
             audio_idx = 2
         cmd.extend(["-i", audio_path])
         cmd.extend(["-filter_complex_script", filter_script, "-map", "[outv]", "-map", f"{audio_idx}:a"])
         cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", str(FPS), "-c:a", "aac", "-shortest", output_path])
-
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
     finally:
         try:
@@ -359,9 +353,6 @@ def create_scene_video(scene_data: dict, audio_path: str, output_path: str, dura
     return True
 
 
-# -----------------------------------------------------------------------------
-# STEP 5: CONCAT + CLEANUP
-# -----------------------------------------------------------------------------
 def concat_segments(segment_paths: list, out_mp4: str) -> bool:
     with open(CONCAT_LIST, "w") as f:
         for p in segment_paths:
@@ -370,7 +361,7 @@ def concat_segments(segment_paths: list, out_mp4: str) -> bool:
         ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", CONCAT_LIST, "-c", "copy", out_mp4],
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=180,
         cwd=SCRIPT_DIR,
     )
     if r.returncode != 0:
@@ -390,30 +381,23 @@ def cleanup(segment_mp4s: list, wavs: list):
         if os.path.isfile(CONCAT_LIST):
             os.remove(CONCAT_LIST)
     except OSError:
-            pass
+        pass
 
 
-# -----------------------------------------------------------------------------
-# MAIN
-# -----------------------------------------------------------------------------
 def main():
     os.makedirs(SEGMENTS_DIR, exist_ok=True)
-
     print("Step 1: Download assets")
     download_assets()
-
     print("Step 2: Generate TTS audio per scene")
     wavs = []
     for i, scene in enumerate(SCENES):
         wav = os.path.join(SEGMENTS_DIR, f"scene_{i:02d}.wav")
         generate_audio(scene["transcript"], wav)
         wavs.append(wav)
-
-    print("Step 3: Measure audio durations (no padding — voice and video same length for sync)")
+    print("Step 3: Measure audio durations")
     durations = [get_audio_duration_sec(w) for w in wavs]
     for i, (w, d) in enumerate(zip(wavs, durations)):
         print(f"  {os.path.basename(w)}: {d:.2f}s")
-
     print("Step 4: Generate scene videos")
     segments = []
     for i, (scene, dur) in enumerate(zip(SCENES, durations)):
@@ -423,12 +407,10 @@ def main():
         else:
             print(f"  Failed scene {i}", file=sys.stderr)
             sys.exit(1)
-
-    print("Step 5: Concatenate to final_video5.mp4")
+    print("Step 5: Concatenate to final_video7.mp4")
     if not concat_segments(segments, OUTPUT_MP4):
         sys.exit(1)
     print(f"  Written {OUTPUT_MP4}")
-
     print("Step 6: Cleanup")
     cleanup(segments, wavs)
     print("Done.")

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Vertical typography video pipeline (1080x1920) → final_video5.mp4.
+Vertical typography video pipeline (1080x1920) → final_video6.mp4.
 Steps: 1) Download assets  2) TTS per scene (Sarvam Bulbul v3)  3) Measure duration
-4) Generate per-scene MP4 (letterbox, overlay then drawtext, heavy shadow)
-5) Concat  6) Cleanup. API key from .env. 30fps, libx264.
+4) Per-scene MP4: letterbox drawbox → overlay image → watermark (white@0.15) → foreground text
+5) Concat  6) Cleanup. API key from .env. 30fps, libx264. Thick condensed block font (Anton).
 """
 
 import base64
@@ -12,25 +12,25 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import urllib.error
 
-SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "your_sarvam_api_key_here")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WIDTH = 1080
 HEIGHT = 1920
 FPS = 30
 TTS_URL = "https://api.sarvam.ai/text-to-speech"
+SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "your_sarvam_api_key_here")
 
-FONT_PATH = os.path.join(SCRIPT_DIR, "luckiest_guy.ttf")
-OUTPUT_MP4 = os.path.join(SCRIPT_DIR, "final_video5.mp4")
-SEGMENTS_DIR = os.path.join(SCRIPT_DIR, "video5_segments")
-CONCAT_LIST = os.path.join(SCRIPT_DIR, "scenes_v5.txt")
+FONT_PATH = os.path.join(SCRIPT_DIR, "anton_font.ttf")
+OUTPUT_MP4 = os.path.join(SCRIPT_DIR, "final_video6.mp4")
+SEGMENTS_DIR = os.path.join(SCRIPT_DIR, "video6_segments")
+CONCAT_LIST = os.path.join(SCRIPT_DIR, "scenes_v6.txt")
 
-# Exact images from web: Wikipedia cat silhouette first (can 429), then jsDelivr fallbacks
 ASSETS = {
-    "luckiest_guy.ttf": "https://github.com/google/fonts/raw/main/apache/luckiestguy/LuckiestGuy-Regular.ttf",
-    "happy_cat.png": [
+    "anton_font.ttf": "https://github.com/google/fonts/raw/main/ofl/anton/Anton-Regular.ttf",
+    "tiny_cat.png": [
         "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/1f431.png",
         "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a9/Cat_silhouette.svg/512px-Cat_silhouette.svg.png",
     ],
@@ -59,7 +59,7 @@ SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "your_sarvam_api_key_here")
 
 
 # -----------------------------------------------------------------------------
-# STEP 1: ASSET DOWNLOADER (requests)
+# STEP 1: ASSET DOWNLOADER (requests / urllib)
 # -----------------------------------------------------------------------------
 def download_assets():
     try:
@@ -81,7 +81,6 @@ def download_assets():
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return resp.read()
 
-    import time
     for fname, urls in ASSETS.items():
         path = os.path.join(SCRIPT_DIR, fname)
         if not os.path.isfile(path):
@@ -167,6 +166,11 @@ def get_audio_duration_sec(path: str) -> float:
     except Exception:
         pass
     try:
+        from mutagen.wave import WAVE
+        return WAVE(path).info.length
+    except Exception:
+        pass
+    try:
         import wave
         with wave.open(path, "rb") as w:
             return w.getnframes() / float(w.getframerate())
@@ -183,103 +187,106 @@ def get_audio_duration_sec(path: str) -> float:
     return 2.0
 
 
-def pad_wav_to_duration(wav_path: str, min_duration: float) -> float:
-    """Pad WAV with silence to at least min_duration; overwrites file. Returns actual duration used."""
-    d = get_audio_duration_sec(wav_path)
-    if d >= min_duration:
-        return d
-    out_path = wav_path + ".padded"
-    r = subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", wav_path, "-af", f"apad=whole_dur={min_duration}", "-t", str(min_duration),
-            "-acodec", "pcm_s16le", "-ar", "24000", out_path,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    if r.returncode == 0 and os.path.isfile(out_path):
-        os.replace(out_path, wav_path)
-        return min_duration
-    return d
-
-
 # -----------------------------------------------------------------------------
-# STEP 3: SCENE CONFIG (letterbox band, images, texts with X,Y,t)
+# STEP 3: SCENE CONFIG — watermark (white@0.15) drawn FIRST, then foreground
 # -----------------------------------------------------------------------------
 def escape_drawtext(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "'\\''")
 
 
-# Band color as FFmpeg hex (0x6b0000). Text x can be int or "(w-tw)/2".
 SCENES = [
     {
-        "transcript": "I'm always happy",
-        "band_color": "0x6b0000",
-        "images": [{"path": "happy_cat.png", "scale_w": 350, "x": 50, "y": 950, "t": 0.0}],
+        "transcript": "How do I explain it to someone",
+        "band_color": "0x62785d",
+        "image": {"path": "tiny_cat.png", "scale_w": 120, "x": 200, "y": 1050, "t": 0.0},
+        "watermark": {"text": "HOW", "size": 400, "x": "(w-tw)/2", "y": 750, "t": 0.0},
         "texts": [
-            {"text": "I'M", "color": "0xFFFFFF", "size": 180, "x": 200, "y": 700, "t": 0.0},
-            {"text": "ALWAYS", "color": "0xffe599", "size": 150, "x": 450, "y": 730, "t": 0.4},
-            {"text": "HAPPY", "color": "0xd7b87a", "size": 160, "x": 500, "y": 900, "t": 0.8},
+            {"text": "HOW DO I", "color": "0xFFFFFF", "size": 130, "x": 200, "y": 700, "t": 0.0},
+            {"text": "EXPLAIN", "color": "0xd2ccb9", "size": 130, "x": "(w-tw)/2", "y": 840, "t": 0.5},
+            {"text": "IT TO SOMEONE", "color": "0xFFFFFF", "size": 100, "x": 200, "y": 980, "t": 1.0},
         ],
     },
     {
-        "transcript": "because I don't expect anything from anyone",
-        "band_color": "0xfbf8cc",
-        "images": [{"path": "happy_cat.png", "scale_w": 350, "x": 350, "y": 950, "t": 0.0}],
+        "transcript": "That my parents are strict",
+        "band_color": "0xa3b19b",
+        "image": {"path": "tiny_cat.png", "scale_w": 120, "x": 300, "y": 1100, "t": 0.0},
+        "watermark": {"text": "STRICT!!", "size": 350, "x": "(w-tw)/2", "y": 800, "t": 0.0},
         "texts": [
-            {"text": "BECAUSE", "color": "0x800000", "size": 140, "x": 50, "y": 650, "t": 0.0},
-            {"text": "I DON'T", "color": "0x38761d", "size": 130, "x": 600, "y": 650, "t": 0.5},
-            {"text": "EXPECT", "color": "0xffffff", "size": 150, "x": 50, "y": 800, "t": 1.0},
-            {"text": "ANYTHING", "color": "0x800000", "size": 140, "x": 50, "y": 900, "t": 1.5},
-            {"text": "FROM ANYONE", "color": "0xffffff", "size": 120, "x": 50, "y": 1180, "t": 2.0},
+            {"text": "THAT MY", "color": "0xFFFFFF", "size": 120, "x": "(w-tw)/2", "y": 750, "t": 0.0},
+            {"text": "PARENTS ARE", "color": "0xFFFFFF", "size": 120, "x": "(w-tw)/2", "y": 880, "t": 0.5},
+            {"text": "STRICT!!", "color": "0x62785d", "size": 150, "x": "(w-tw)/2", "y": 1020, "t": 1.0},
         ],
     },
     {
-        "transcript": "and expectations always hurt",
-        "band_color": "0x4a5d23",
-        "images": [{"path": "happy_cat.png", "scale_w": 350, "x": 50, "y": 950, "t": 0.0}],
+        "transcript": "But not that strict",
+        "band_color": "0xd2ccb9",
+        "image": {"path": "tiny_cat.png", "scale_w": 120, "x": "(main_w-overlay_w)/2", "y": 1100, "t": 0.0},
+        "watermark": {"text": "HUH..", "size": 350, "x": "(w-tw)/2", "y": 800, "t": 0.0},
         "texts": [
-            {"text": "EXPECTATIONS", "color": "0xffffff", "size": 130, "x": 150, "y": 750, "t": 0.0},
-            {"text": "ALWAYS", "color": "0xffe599", "size": 120, "x": 450, "y": 900, "t": 1.0},
-            {"text": "HURT", "color": "0xffffff", "size": 180, "x": 450, "y": 1050, "t": 1.5},
+            {"text": "BUT!", "color": "0x62785d", "size": 150, "x": "(w-tw)/2", "y": 750, "t": 0.0},
+            {"text": "NOT THAT", "color": "0x62785d", "size": 120, "x": "(w-tw)/2", "y": 910, "t": 0.5},
+            {"text": "STRICT", "color": "0x62785d", "size": 120, "x": "(w-tw)/2", "y": 1050, "t": 0.9},
         ],
     },
     {
-        "transcript": "So keep smiling,",
-        "band_color": "0x6b0000",
-        "images": [],
+        "transcript": "Like they let me go out",
+        "band_color": "0xd2ccb9",
+        "image": {"path": "tiny_cat.png", "scale_w": 120, "x": 600, "y": 1050, "t": 0.0},
+        "watermark": None,
         "texts": [
-            {"text": "SO", "color": "0xffe599", "size": 150, "x": "(w-tw)/2", "y": 650, "t": 0.0},
-            {"text": "KEEP", "color": "0xffe599", "size": 180, "x": "(w-tw)/2", "y": 850, "t": 0.4},
-            {"text": "SMILING", "color": "0xffe599", "size": 160, "x": "(w-tw)/2", "y": 1050, "t": 0.8},
+            {"text": "LIKE THEY", "color": "0x62785d", "size": 130, "x": 150, "y": 750, "t": 0.0},
+            {"text": "LET ME GO", "color": "0xa3b19b", "size": 160, "x": 150, "y": 890, "t": 0.5},
+            {"text": "OUT", "color": "0xa3b19b", "size": 140, "x": "(w-tw)/2", "y": 1020, "t": 1.0},
         ],
     },
     {
-        "transcript": "be happy",
-        "band_color": "0x6b0000",
-        "images": [],
+        "transcript": "But they also won't",
+        "band_color": "0x62785d",
+        "image": {"path": "tiny_cat.png", "scale_w": 120, "x": 650, "y": 1050, "t": 0.0},
+        "watermark": None,
         "texts": [
-            {"text": "BE", "color": "0xffe599", "size": 180, "x": "(w-tw)/2", "y": 750, "t": 0.0},
-            {"text": "HAPPY", "color": "0xffe599", "size": 180, "x": "(w-tw)/2", "y": 950, "t": 0.5},
+            {"text": "BUT THEY", "color": "0xa3b19b", "size": 120, "x": "(w-tw)/2", "y": 720, "t": 0.0},
+            {"text": "ALSO", "color": "0xa3b19b", "size": 160, "x": "(w-tw)/2", "y": 850, "t": 0.35},
+            {"text": "WON'T", "color": "0xa3b19b", "size": 160, "x": "(w-tw)/2", "y": 1000, "t": 0.7},
         ],
     },
     {
-        "transcript": "and live for yourself",
-        "band_color": "0x6b0000",
-        "images": [],
+        "transcript": "I have freedom but I also don't",
+        "band_color": "0x62785d",
+        "image": {"path": "tiny_cat.png", "scale_w": 120, "x": 700, "y": 1100, "t": 0.0},
+        "watermark": None,
         "texts": [
-            {"text": "AND", "color": "0xffe599", "size": 150, "x": "(w-tw)/2", "y": 650, "t": 0.0},
-            {"text": "LIVE", "color": "0xffe599", "size": 180, "x": "(w-tw)/2", "y": 800, "t": 0.25},
-            {"text": "FOR", "color": "0xffe599", "size": 150, "x": "(w-tw)/2", "y": 950, "t": 0.5},
-            {"text": "YOURSELF", "color": "0xffe599", "size": 160, "x": "(w-tw)/2", "y": 1050, "t": 0.75},
+            {"text": "I", "color": "0xa3b19b", "size": 120, "x": 150, "y": 700, "t": 0.0},
+            {"text": "HAVE FREEDOM", "color": "0xa3b19b", "size": 120, "x": 150, "y": 780, "t": 0.25},
+            {"text": "BUT I ALSO", "color": "0xFFFFFF", "size": 110, "x": 150, "y": 900, "t": 0.9},
+            {"text": "DON'T", "color": "0xFFFFFF", "size": 120, "x": 150, "y": 1020, "t": 1.25},
+        ],
+    },
+    {
+        "transcript": "I can do what I want, but I also can't",
+        "band_color": "0xd2ccb9",
+        "image": {"path": "tiny_cat.png", "scale_w": 120, "x": 800, "y": 1050, "t": 0.0},
+        "watermark": None,
+        "texts": [
+            {"text": "I CAN DO WHAT I WANT,", "color": "0x62785d", "size": 80, "x": "(w-tw)/2", "y": 800, "t": 0.0},
+            {"text": "BUT I ALSO CAN'T", "color": "0xFFFFFF", "size": 80, "x": "(w-tw)/2", "y": 920, "t": 1.5},
+        ],
+    },
+    {
+        "transcript": "I need a word for this concept",
+        "band_color": "0x62785d",
+        "image": {"path": "tiny_cat.png", "scale_w": 120, "x": 800, "y": 1000, "t": 0.0},
+        "watermark": {"text": "CONCEPT", "size": 300, "x": "(w-tw)/2", "y": 800, "t": 0.0},
+        "texts": [
+            {"text": "I NEED A WORD FOR", "color": "0xa3b19b", "size": 90, "x": "(w-tw)/2", "y": 750, "t": 0.0},
+            {"text": "THIS CONCEPT", "color": "0xd2ccb9", "size": 130, "x": "(w-tw)/2", "y": 880, "t": 1.0},
         ],
     },
 ]
 
 
 # -----------------------------------------------------------------------------
-# STEP 4: create_scene_video — drawbox, overlay(s) FIRST, then drawtext (shadow)
+# STEP 4: create_scene_video — drawbox → overlay → watermark (white@0.15) → foreground
 # -----------------------------------------------------------------------------
 def create_scene_video(scene_data: dict, audio_path: str, output_path: str, duration: float) -> bool:
     fontfile = FONT_PATH
@@ -294,19 +301,29 @@ def create_scene_video(scene_data: dict, audio_path: str, output_path: str, dura
         parts.append(f"[{vid}]drawbox=y=600:w=1080:h=720:color={band}:t=fill[bg]")
         vid = "bg"
 
-    images = scene_data.get("images") or []
+    im = scene_data.get("image")
     img_path = None
-    for i, im in enumerate(images):
+    if im:
         path = os.path.join(SCRIPT_DIR, im["path"])
-        if not os.path.isfile(path):
-            continue
-        if img_path is None:
+        if os.path.isfile(path):
             img_path = path
-        w, x, y, t0 = im.get("scale_w", 350), im["x"], im["y"], im.get("t", 0.0)
-        parts.append(f"[1:v]scale={w}:-1[img{i}]")
-        t0_esc = str(t0).replace(",", "\\,")
-        parts.append(f"[{vid}][img{i}]overlay={x}:{y}:enable='gte(t\\,{t0_esc})'[ov{i}]")
-        vid = f"ov{i}"
+            w, x, y, t0 = im.get("scale_w", 120), im["x"], im["y"], im.get("t", 0.0)
+            t0_esc = str(t0).replace(",", "\\,")
+            parts.append(f"[1:v]scale={w}:-1[img]")
+            parts.append(f"[{vid}][img]overlay={x}:{y}:enable='gte(t\\,{t0_esc})'[v1]")
+            vid = "v1"
+
+    wm = scene_data.get("watermark")
+    if wm:
+        text = escape_drawtext(wm["text"])
+        size = wm["size"]
+        x, y, t = wm["x"], wm["y"], wm["t"]
+        t_esc = str(t).replace(",", "\\,")
+        parts.append(
+            f"[{vid}]drawtext=fontfile='{fontfile}':text='{text}':fontsize={size}:fontcolor=white@0.15:"
+            f"x={x}:y={y}:enable='gte(t\\,{t_esc})'[v2]"
+        )
+        vid = "v2"
 
     next_idx = 0
     for line in scene_data.get("texts") or []:
@@ -320,7 +337,7 @@ def create_scene_video(scene_data: dict, audio_path: str, output_path: str, dura
         t_esc = str(t).replace(",", "\\,")
         parts.append(
             f"[{vid}]drawtext=fontfile='{fontfile}':text='{text}':fontsize={size}:fontcolor={color}:"
-            f"x={x_str}:y={y}:shadowcolor=black:shadowx=6:shadowy=6:enable='gte(t\\,{t_esc})'[tx{next_idx}]"
+            f"x={x_str}:y={y}:enable='gte(t\\,{t_esc})'[tx{next_idx}]"
         )
         vid = f"tx{next_idx}"
         next_idx += 1
@@ -334,13 +351,16 @@ def create_scene_video(scene_data: dict, audio_path: str, output_path: str, dura
             f.write(filter_body)
     except Exception:
         os.close(fd)
-        os.remove(filter_script)
+        try:
+            os.remove(filter_script)
+        except OSError:
+            pass
         raise
 
     try:
         cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=black:s={WIDTH}x{HEIGHT}:d={duration}:r={FPS}"]
         audio_idx = 1
-        if images and img_path and os.path.isfile(img_path):
+        if im and img_path:
             cmd.extend(["-loop", "1", "-i", img_path])
             audio_idx = 2
         cmd.extend(["-i", audio_path])
@@ -390,7 +410,7 @@ def cleanup(segment_mp4s: list, wavs: list):
         if os.path.isfile(CONCAT_LIST):
             os.remove(CONCAT_LIST)
     except OSError:
-            pass
+        pass
 
 
 # -----------------------------------------------------------------------------
@@ -409,7 +429,7 @@ def main():
         generate_audio(scene["transcript"], wav)
         wavs.append(wav)
 
-    print("Step 3: Measure audio durations (no padding — voice and video same length for sync)")
+    print("Step 3: Measure audio durations")
     durations = [get_audio_duration_sec(w) for w in wavs]
     for i, (w, d) in enumerate(zip(wavs, durations)):
         print(f"  {os.path.basename(w)}: {d:.2f}s")
@@ -424,7 +444,7 @@ def main():
             print(f"  Failed scene {i}", file=sys.stderr)
             sys.exit(1)
 
-    print("Step 5: Concatenate to final_video5.mp4")
+    print("Step 5: Concatenate to final_video6.mp4")
     if not concat_segments(segments, OUTPUT_MP4):
         sys.exit(1)
     print(f"  Written {OUTPUT_MP4}")
